@@ -4,6 +4,7 @@
  * Output: [tpc0, tpc1, ...] sorted descending, or error on stderr
  */
 
+#include <iostream>
 #include <cstdio>
 #include <cstdlib>
 #include <set>
@@ -26,6 +27,10 @@ __device__ __forceinline__ uint32_t get_smid() {
     uint32_t r; asm("mov.u32 %0, %%smid;" : "=r"(r)); return r;
 }
 
+__device__ __forceinline__ uint32_t get_clusterid() {
+    uint32_t r; asm("mov.u32 %0, %%clusterid.x;" : "=r"(r)); return r;
+}
+
 extern __shared__ char smem[];
 
 __global__ void gpc_query_kernel(uint32_t *out) {
@@ -35,7 +40,7 @@ __global__ void gpc_query_kernel(uint32_t *out) {
     
     if (threadIdx.x == 0) {
         out[blockIdx.x * 2 + 0] = get_smid();
-        out[blockIdx.x * 2 + 1] = blockIdx.x / cluster.num_blocks();
+        out[blockIdx.x * 2 + 1] = get_clusterid(); //blockIdx.x / cluster.num_blocks();
     }
     
     cluster.sync();
@@ -63,66 +68,85 @@ int main() {
     int max_smem = prop.sharedMemPerBlockOptin;
     
     CHK(cudaFuncSetAttribute(gpc_query_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem));
-    CHK(cudaFuncSetAttribute(gpc_query_kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+    // CHK(cudaFuncSetAttribute(gpc_query_kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
 
-    int max_cluster = 16;
+    int max_cluster = 8;
     {
         cudaLaunchConfig_t cfg = {};
         cfg.blockDim = dim3(32, 1, 1);
         cfg.gridDim = dim3(128, 1, 1);
         cfg.dynamicSmemBytes = max_smem;
         if (cudaOccupancyMaxPotentialClusterSize(&max_cluster, (void*)gpc_query_kernel, &cfg) != cudaSuccess)
-            max_cluster = 16;
+            max_cluster = 8;
     }
-    if (max_cluster < 2) max_cluster = 16;
+    if (max_cluster < 2) max_cluster = 8;
 
     UF uf;
     std::set<uint32_t> all_sms;
 
-    for (int csz = 2; csz <= max_cluster; csz++) {
-        int nblocks = ((num_sms + csz - 1) / csz) * csz;
-        size_t out_sz = nblocks * 2 * sizeof(uint32_t);
-        
-        uint32_t *d_out;
-        CHK(cudaMalloc(&d_out, out_sz));
-        CHK(cudaMemset(d_out, 0xff, out_sz));
-        
-        cudaLaunchConfig_t config = {};
-        config.gridDim = dim3(nblocks, 1, 1);
-        config.blockDim = dim3(32, 1, 1);
-        config.dynamicSmemBytes = max_smem;
+    constexpr int nblocks = 256;
+    std::map<uint32_t, std::vector<uint32_t>> cluster_sms;
+    std::set<uint32_t> unique_sms;
+    std::set<std::vector<uint32_t>> unique_clusters;
 
-        cudaLaunchAttribute attr;
-        attr.id = cudaLaunchAttributeClusterDimension;
-        attr.val.clusterDim = {(unsigned)csz, 1, 1};
-        config.attrs = &attr;
-        config.numAttrs = 1;
+    for (int iter=0; iter < 100; iter++) {
+        for (int csz = 2; csz <= max_cluster; csz=csz*2) {
+            // int nblocks = ((num_sms + csz - 1) / csz) * csz;
+            size_t out_sz = nblocks * 2 * sizeof(uint32_t);
+            
+            uint32_t *d_out;
+            CHK(cudaMalloc(&d_out, out_sz));
+            CHK(cudaMemset(d_out, 0xff, out_sz));
+            
+            cudaLaunchConfig_t config = {};
+            config.gridDim = dim3(nblocks, 1, 1);
+            config.blockDim = dim3(32, 1, 1);
+            config.dynamicSmemBytes = max_smem;
 
-        CHK(cudaLaunchKernelEx(&config, gpc_query_kernel, d_out));
-        CHK(cudaDeviceSynchronize());
+            cudaLaunchAttribute attr;
+            attr.id = cudaLaunchAttributeClusterDimension;
+            attr.val.clusterDim = {(unsigned)csz, 1, 1};
+            config.attrs = &attr;
+            config.numAttrs = 1;
 
-        std::vector<uint32_t> h_out(nblocks * 2);
-        CHK(cudaMemcpy(h_out.data(), d_out, out_sz, cudaMemcpyDeviceToHost));
-        CHK(cudaFree(d_out));
+            CHK(cudaLaunchKernelEx(&config, gpc_query_kernel, d_out));
+            CHK(cudaDeviceSynchronize());
 
-        std::map<uint32_t, std::vector<uint32_t>> clusters;
-        for (int b = 0; b < nblocks; b++) {
-            uint32_t smid = h_out[b * 2 + 0];
-            uint32_t cid = h_out[b * 2 + 1];
-            if (smid != 0xffffffff) {
-                clusters[cid].push_back(smid);
-                all_sms.insert(smid);
+            std::vector<uint32_t> h_out(nblocks * 2);
+            CHK(cudaMemcpy(h_out.data(), d_out, out_sz, cudaMemcpyDeviceToHost));
+            CHK(cudaFree(d_out));
+
+            std::map<uint32_t, std::vector<uint32_t>> clusters;
+            for (int b = 0; b < nblocks; b++) {
+                uint32_t smid = h_out[b * 2 + 0];
+                uint32_t cid = h_out[b * 2 + 1];
+                if (smid != 0xffffffff) {
+                    clusters[cid].push_back(smid);
+                    all_sms.insert(smid);
+                }
+
+                if (iter == 50 && csz == 16){
+                    unique_sms.insert(smid);
+                    cluster_sms[cid].push_back(smid);
+                }
             }
+
+            if (iter == 50 && csz == 16) {
+                for (auto &[cid, sms] : cluster_sms) {
+                    std::sort(sms.begin(), sms.end());
+                    unique_clusters.insert(sms);
+                }
+            }
+            
+            for (auto &[cid, sms] : clusters)
+                for (size_t i = 1; i < sms.size(); i++)
+                    uf.unite(sms[0], sms[i]);
         }
-        
-        for (auto &[cid, sms] : clusters)
-            for (size_t i = 1; i < sms.size(); i++)
-                uf.unite(sms[0], sms[i]);
     }
 
     if (all_sms.size() != (size_t)num_sms) {
         fprintf(stderr, "error: detected %zu SMs, expected %d\n", all_sms.size(), num_sms);
-        return 1;
+        // return 1;
     }
 
     std::map<uint32_t, std::vector<uint32_t>> gpcs;
@@ -139,5 +163,23 @@ int main() {
         printf("%s%d", i ? ", " : "", tpcs[i]);
     printf("]\n");
 
+    printf("For cluster size 8\n");
+    printf("  Unique SMs: %zu\n", unique_sms.size());
+
+    for (auto &[cid, sms] : cluster_sms) {
+        // std::sort(sms.begin(), sms.end());
+        printf("  Cluster %d: [", cid);
+        for (size_t i = 0; i < sms.size(); i++)
+            printf("%s%d", i ? ", " : "", sms[i]);
+        printf("]\n");
+    }
+
+    printf("  Unique Clusters: %zu\n", unique_clusters.size());
+    for (const auto &sms : unique_clusters) {
+        printf("  Cluster: [");
+        for (size_t i = 0; i < sms.size(); i++)
+            printf("%s%d", i ? ", " : "", sms[i]);
+        printf("]\n");
+    }
     return 0;
 }
