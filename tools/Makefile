@@ -1,9 +1,12 @@
-ARCH ?= sm_100a
+ARCH ?= sm_90a
+TARGETS ?= gpc_query gpc_query_matrix
 
-gpc_query: gpc_query.cu
+all: $(TARGETS)
+
+%: %.cu
 	nvcc -arch=$(ARCH) -O2 -std=c++17 -o $@ $<
 
 clean:
-	rm -f gpc_query
+	rm -f $(TARGETS)
 
 .PHONY: clean
