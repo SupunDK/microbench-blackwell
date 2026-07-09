@@ -2,3 +2,7 @@
 cutlass/
 flashinfer/
 .venv/
+
+# executables
+tools/gpc_query
+tools/gpc_query_matrix
